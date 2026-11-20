@@ -119,6 +119,12 @@ __WR_CHAT_MODE__.exit()     // 退出
 __WR_CHAT_MODE__.refreshShelf()
 ```
 
+## 多站点复用
+
+当前外壳、日志栏、工作目录伪装已抽象为可复用模式，包含目标站点矩阵、适配器接口、工程骨架与合规底线：
+
+- [多站点复用蓝图（linux.do / 小红书 / Chiphell / 知乎 / 虎扑 / 微博）](docs/MODE-BLUEPRINT.md)
+
 ## 路线图
 
 - **M1**：微信外壳 + PDF 检测 + 左栏 + 文件卡片 + 右栏预览
