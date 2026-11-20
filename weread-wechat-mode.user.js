@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         微信读书·微信模式
 // @namespace    weread-wechat-mode
-// @version      0.7.0
+// @version      0.7.2
 // @description  M5：微信读书 PDF / EPUB 阅读器 + Grafana 真实日志 + IDE 工作目录伪装。
 // @author       weread-wechat-mode
 // @license      MIT
@@ -54,7 +54,7 @@
   if (W.__WR_CHAT_MODE_INSTALLED__) return;
   W.__WR_CHAT_MODE_INSTALLED__ = true;
 
-  const VERSION = "0.7.0";
+  const VERSION = "0.7.2";
   const LOG_PREFIX = "[微信读书·微信模式]";
   const HOST_ID = "wr-chat-host";
   const MIN_WIDTH = 1000;
@@ -1294,9 +1294,17 @@
         .wr-pv-btn {
           border: 0; background: transparent; color: #666; cursor: pointer; padding: 4px 7px;
           border-radius: 4px; font: 12px/1.4 inherit; line-height: 1.4;
+          height: 26px; display: inline-flex; align-items: center; justify-content: center;
         }
         .wr-pv-btn:hover { background: #e9e9e9; color: #111; }
         .wr-pv-btn.active { color: #07c160; }
+        .wr-pv-back { display: inline-flex; align-items: center; gap: 4px; }
+        .wr-pv-back::before {
+          content: ""; width: 6px; height: 6px; flex: 0 0 6px;
+          border-left: 1.5px solid currentColor; border-bottom: 1.5px solid currentColor;
+          border-radius: 1px; transform: rotate(45deg); margin-top: -1px;
+        }
+        #wr-pv-prev, #wr-pv-next { font-size: 15px; line-height: 1; padding: 2px 8px; }
         .wr-pv-pageno { display: inline-flex; align-items: center; gap: 4px; color: #8a8f98; font: 11px Consolas, monospace; }
         .wr-pv-pageno input {
           width: 38px; background: #fff; border: 1px solid #dcdcdc; border-radius: 3px; color: #333;
@@ -1558,8 +1566,32 @@
     return ui;
   }
 
+  function isTypingTarget(ev) {
+    try {
+      const path = typeof ev.composedPath === "function" ? ev.composedPath() : [];
+      const el = (path && path[0]) || ev.target;
+      if (!el || !el.tagName) return false;
+      const tag = String(el.tagName).toLowerCase();
+      return tag === "input" || tag === "textarea" || tag === "select" || !!el.isContentEditable;
+    } catch (e) {
+      return false;
+    }
+  }
+
   function onKeydown(ev) {
-    if (ev.key === "Escape" && state.previewOpen) hidePreview();
+    if (ev.key === "Escape" && state.previewOpen) {
+      hidePreview();
+      return;
+    }
+    if (!ev.ctrlKey || !ev.altKey || ev.shiftKey || ev.repeat) return;
+    const key = String(ev.key || "").toLowerCase();
+    if (key !== "q" && ev.code !== "KeyQ") return;
+    if (!state.enabled || !state.ctx || !state.ui) return;
+    if (state.ui.shell.style.display === "none") return;
+    if (isTypingTarget(ev)) return;
+    ev.preventDefault();
+    ev.stopPropagation();
+    toggleLogsOnly();
   }
 
   function toast(message) {
@@ -1649,7 +1681,7 @@
       ui.head.innerHTML = `
         <span class="wr-head-doc">PDF</span>
         <div class="wr-head-main">
-          <div class="wr-head-title" id="wr-head-title" title="点击隐藏/显示阅读区">${escapeHtml(WORK_DOC_NAME)}</div>
+          <div class="wr-head-title" id="wr-head-title" title="点击隐藏/显示阅读区（Ctrl+Alt+Q）">${escapeHtml(WORK_DOC_NAME)}</div>
           <div class="wr-head-sub">工作文档 · PDF</div>
         </div>
         <span class="wr-head-spacer"></span>
@@ -1660,7 +1692,7 @@
       ui.head.innerHTML = `
         ${avatarHtml(ctx, "wr-head-cover")}
         <div class="wr-head-main">
-          <div class="wr-head-title" id="wr-head-title" title="点击隐藏/显示阅读区">${escapeHtml(ctx.title)}</div>
+          <div class="wr-head-title" id="wr-head-title" title="点击隐藏/显示阅读区（Ctrl+Alt+Q）">${escapeHtml(ctx.title)}</div>
           <div class="wr-head-sub">${escapeHtml(sub)}</div>
         </div>
         <span class="wr-head-spacer"></span>
@@ -1993,8 +2025,8 @@
   function pvBarHtml(extra) {
     const title = workDocName();
     return `<div class="wr-pv-bar">
-      <button class="wr-pv-btn" id="wr-pv-back">‹ 返回</button>
-      <span class="wr-pv-title" id="wr-pv-title" title="点击隐藏/显示阅读区">${escapeHtml(title)}</span>
+      <button class="wr-pv-btn wr-pv-back" id="wr-pv-back">返回</button>
+      <span class="wr-pv-title" id="wr-pv-title" title="点击隐藏/显示阅读区（Ctrl+Alt+Q）">${escapeHtml(title)}</span>
       <span class="wr-pv-spacer"></span>
       ${extra || ""}
     </div>`;
@@ -2465,7 +2497,7 @@
         <span class="wr-pv-zoom" id="wr-pv-zoom">${Math.round(DEFAULT_ZOOM * 100)}%</span>
         <button class="wr-pv-btn" id="wr-pv-zoom-in" title="放大">+</button>
         <button class="wr-pv-btn" id="wr-pv-fit">适应宽度</button>
-        <button class="wr-pv-btn active" id="wr-pv-logs" title="切换日志栏">日志</button>
+        <button class="wr-pv-btn active" id="wr-pv-logs" title="切换日志栏（Ctrl+Alt+Q）">日志</button>
       `)}
       <div class="wr-pv-body" id="wr-pv-body">
         <div class="wr-pv-main">
@@ -3099,7 +3131,7 @@
         <span class="wr-epub-chapter" id="epub-chapter-title"></span>
         <button class="wr-pv-btn" id="epub-next" title="下一节">下一章</button>
         <button class="wr-pv-btn" id="epub-toc-btn" title="目录">目录</button>
-        <button class="wr-pv-btn active" id="wr-pv-logs" title="切换日志栏">日志</button>
+        <button class="wr-pv-btn active" id="wr-pv-logs" title="切换日志栏（Ctrl+Alt+Q）">日志</button>
       `)}
       <div class="wr-pv-body" id="wr-pv-body">
         <div class="wr-pv-main">
@@ -3373,6 +3405,9 @@
         if (state.enabled && state.ui) exitMode();
         else if (state.ctx) enterMode();
         else safeBoot();
+      });
+      GM_registerMenuCommand("切换阅读区 / 日志（Ctrl+Alt+Q）", () => {
+        if (state.enabled && state.ctx && state.ui) toggleLogsOnly();
       });
       GM_registerMenuCommand("刷新书架", () => {
         state.shelf = [];
