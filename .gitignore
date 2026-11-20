@@ -1,3 +1,6 @@
 node_modules/
 .DS_Store
 *.log
+# recovery artifacts
+*.bak
+*.restore.js

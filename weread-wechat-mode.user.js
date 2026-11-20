@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         ���读书·���模式
+// @name         微信读书·微信模式
 // @namespace    weread-wechat-mode
-// @version      0.6.2
-// @description  M4：微信�� PDF 阅�� + Grafana 真实日志 + IDE 工作�����
+// @version      0.7.0
+// @description  M5：微信读书 PDF / EPUB 阅读器 + Grafana 真实日志 + IDE 工作目录伪装。
 // @author       weread-wechat-mode
 // @license      MIT
 // @match        https://weread.qq.com/*
@@ -20,26 +20,31 @@
 // ==/UserScript==
 
 /*
- * M4 范围�
- *   - ��� /web/reader/* 且�测到 PDF 管线时接管（pdfUrl / fm=pdf / /cos/download / PDF DOM�
- *   - 左栏：本地�录过� PDF � + 书架接口里能�� PDF 的书
- *   - 点左栏�€�微信�书�€�四���切换“工作目录�€�伪装：文件树�€�工作文档名、标签页标�
- *   - 右栏：微信式文件消息卡片，点击后� PDF 字节，用 PDF.js ���阅�器渲�
- *   - PDF 区域白底贴边、页面居���右侧固定“运行日志�€�栏，铺满高度，����
- *   - 不做：�落气泡�€�划�/想法/评�、字号缩放�€�暗黑模式�€�左右栏拖拽
+ * M5 范围：
+ *   - 只在 /web/reader/* 接管；PDF 与文字 EPUB 两种适配器
+ *   - PDF：检测 pdfUrl / fm=pdf / /cos/download / PDF DOM，PDF.js 自绘页面
+ *   - EPUB：挂住官方阅读器的 /web/book/chapter/e_N 响应，解码 base64 后渲染成白色文档
+ *   - EPUB 章节目录读取官方 .readerCatalog_list_item，点击目录项驱动官方阅读器加载章节
+ *   - 左栏：本地记录过的书 + 书架接口里能确认的 PDF / EPUB 书
+ *   - 点左栏“微信读书”切换“工作目录”伪装：文件树、分支下拉、工作文档名、标签页标题
+ *   - 右栏：微信式文件消息卡片，PDF/EPUB 都打开同类阅读器
+ *   - 右侧固定“运行日志”栏，优先 Grafana 真实日志，失败回退模拟；支持只看日志
+ *   - 不做：气泡聊天、划线/想法/评论、字号缩放、暗黑模式
  *
- * 隐��
- *   - PDF 字节通过 GM_xmlhttpRequest 下载（@connect *），�求脚���析出的�名地�€
- *   - 真实日志查�发往 igfa.dcgstd.cn（使用你浏�器里� Grafana 登录态），查询�句固�
- *   - 模拟日志与工作目录为���生成；所有日志只显示在本地，不上�
- *   - 不�� Cookie，不上传统�数据
+ * 隐私：
+ *   - PDF 字节通过 GM_xmlhttpRequest 下载（@connect *），只请求脚本解析出的签名地址
+ *   - EPUB 章节响应由页面自己发起并签名，本脚本只读响应、解码、缓存，不伪造请求
+ *   - 真实日志查询发往 igfa.dcgstd.cn（使用浏览器里的 Grafana 登录态），查询语句固定
+ *   - 模拟日志与工作目录为本地生成；所有内容只显示在本地，不上传
+ *   - 不记录 Cookie，不上传统计数据
  *
- * 已知风险�
- *   - 签名 PDF 地址���过期，�览前会重新获�
- *   - PDF �€要整份下载后才能预�，大文件首�打开较慢
- *   - PDF.js 通过 CDN @require；pdf.worker 也一� @require 并优先走主线� worker，绕�€站点 CSP
- *   - 若主线程 worker 不可���再依次尝� CDN Worker / Blob Worker / 运�时注�
- *   - 书架接口字����，PDF 过滤有兜底；当前书�终会出现在左�
+ * 已知风险：
+ *   - 签名 PDF 地址可能过期，预览前会重新获取
+ *   - PDF 需要整份下载后才能预览，大文件首次打开较慢
+ *   - PDF.js 与 pdf.worker 通过 CDN @require；优先主线程 worker，失败再逐级回退
+ *   - EPUB 依赖官方阅读器 DOM（目录、正文容器）与章节分片格式；站点改版可能失效
+ *   - EPUB 翻章会驱动官方阅读器，可能改变官方阅读进度
+ *   - 书架接口字段未知，格式过滤有兜底；当前书始终会出现在左栏
  */
 
 (() => {
@@ -49,8 +54,8 @@
   if (W.__WR_CHAT_MODE_INSTALLED__) return;
   W.__WR_CHAT_MODE_INSTALLED__ = true;
 
-  const VERSION = "0.6.2";
-  const LOG_PREFIX = "[���读书·���模式]";
+  const VERSION = "0.7.0";
+  const LOG_PREFIX = "[微信读书·微信模式]";
   const HOST_ID = "wr-chat-host";
   const MIN_WIDTH = 1000;
   const DETECT_TIMEOUT = 20000;
@@ -83,6 +88,7 @@
 
   const state = {
     enabled: storeGet(STORE.enabled, true) !== false,
+    startedAt: Date.now(),
     bootToken: 0,
     ctx: null,
     ui: null,
@@ -116,7 +122,7 @@
     originalFavicons: null,
     createdFavicon: null,
     leftWidth: clamp(Number(storeGet(STORE.leftWidth, 280)) || 280, 220, 460),
-    logWidth: clamp(Number(storeGet(STORE.logWidth, 340)) || 340, 220, 640),
+    logWidth: clamp(Number(storeGet(STORE.logWidth, 340)) || 340, 220, 1800),
     logsOnly: storeGet(STORE.logsOnly, false) === true,
     chatLogTimer: null,
   };
@@ -181,7 +187,7 @@
     if (diff < 24 * 3600 * 1000) return `${Math.floor(diff / 3600000)} 小时前`;
     if (diff < 48 * 3600 * 1000) return "昨天";
     const d = new Date(ms);
-    return `${d.getMonth() + 1}�${d.getDate()}�;
+    return `${d.getMonth() + 1}月${d.getDate()}日`;
   }
 
   function clamp(n, min, max) {
@@ -244,11 +250,17 @@
     }
   }
 
+  function readerInfoBase(id) {
+    const s = String(id || "");
+    const i = s.indexOf("k");
+    return i > 0 ? s.slice(0, i) : s;
+  }
+
   function docTitle() {
     const t = String(document.title || "")
-      .replace(/\s*-\s*���读书\s*$/, "")
+      .replace(/\s*-\s*微信读书\s*$/, "")
       .trim();
-    return t && t !== "���读书" ? t : "";
+    return t && t !== "微信读书" ? t : "";
   }
 
   function readerState() {
@@ -260,7 +272,7 @@
     }
   }
 
-  // 阅�� infoId 里可解出导入� bookId，例� ... => CB_6DR0M50OA0vl77l75iAQjBlh
+  // 阅读页 infoId 里可解出导入书 bookId，例如 ... => CB_6DR0M50OA0vl77l75iAQjBlh
   function cbIdFromInfoId(infoId) {
     const s = String(infoId || "");
     if (!s) return "";
@@ -277,7 +289,7 @@
     return best.length >= 10 ? `CB_${best}` : "";
   }
 
-  /* ============================== ���读书请求信号 ============================== */
+  /* ============================== 微信读书请求信号 ============================== */
 
   function installSignalHooks() {
     const origFetch = W.fetch;
@@ -323,7 +335,7 @@
           return promise;
         };
       } catch (e) {
-        warn("fetch 钩子安�失败", e);
+        warn("fetch 钩子安装失败", e);
       }
     }
 
@@ -384,7 +396,7 @@
           return origSend.apply(this, arguments);
         };
       } catch (e) {
-        warn("XHR 钩子安�失败", e);
+        warn("XHR 钩子安装失败", e);
       }
     }
   }
@@ -454,8 +466,7 @@
   function decodeChapterChunk(raw) {
     const str = String(raw || "").trim();
     if (!str || str.length < 40) return "";
-    const offsets = [33, 32];
-    for (const off of offsets) {
+    for (const off of [33, 32]) {
       try {
         const b64 = str.slice(off);
         if (!/^[A-Za-z0-9+/]+={0,2}$/.test(b64.slice(0, 120))) continue;
@@ -465,7 +476,7 @@
         const out = new TextDecoder("utf-8").decode(bytes);
         if (out && !out.includes("�")) return out;
       } catch (e) {
-        /* try next offset */
+        /* try next */
       }
     }
     return "";
@@ -487,7 +498,6 @@
       const isStyle = Number(body.st) === 1;
       const text = decodeChapterChunk(responseText);
       if (!text) return;
-
       let set = state.epubChunks.get(c);
       if (!set) {
         set = { html: new Map(), css: new Map(), at: 0 };
@@ -538,7 +548,7 @@
     return "";
   }
 
-  /* ============================== PDF �€� ============================== */
+  /* ============================== PDF 检测 ============================== */
 
   function domLooksPdf() {
     const selectors = [
@@ -590,15 +600,73 @@
       cbBookId,
       readerUrl: location.href,
       pdfUrl,
+      bookType: "pdf",
       lastReadAt: Date.now(),
     };
+  }
+
+  function detectEpub() {
+    if (!isReaderPage()) return null;
+
+    const st = readerState();
+    const bi = st && st.bookInfo ? st.bookInfo : null;
+    const infoId = (st && st.infoId) || pathInfoId();
+    const derivedCb = cbIdFromInfoId(infoId);
+    const pdfUrl = st && typeof st.pdfUrl === "string" ? st.pdfUrl : "";
+    const fmForThis = signals.fmPdf && (!signals.fmPdfInfoId || !infoId || signals.fmPdfInfoId === infoId);
+    const cosForThis =
+      signals.sawCos && (!derivedCb || !signals.cosBookId || signals.cosBookId === derivedCb);
+    if (fmForThis || cosForThis || pdfUrl || domLooksPdf()) return null;
+    if (document.querySelector(".readerForbidden")) return null;
+    if (bi && bi.isEPUBComics) return null;
+    if (Date.now() - state.startedAt < 1500) return null;
+
+    const tocItems = document.querySelectorAll(".readerCatalog_list_item");
+    const content = document.querySelector(".readerChapterContent");
+    const catalogMarker = document.querySelector(
+      ".readerCatalog, .readerControls_item.catalog, .rbb_item.catalog",
+    );
+    if (!catalogMarker && !tocItems.length) return null;
+    if (!tocItems.length && !content) return null;
+
+    const format = String((bi && bi.format) || "").toLowerCase();
+    if (format && format !== "epub" && !tocItems.length) return null;
+
+    const domTitleEl = document.querySelector(".readerCatalog_bookInfo_title");
+    const chapterTitleEl = document.querySelector(".readerTopBar_title_chapter");
+    const title =
+      (bi && bi.title) ||
+      (domTitleEl && domTitleEl.textContent ? domTitleEl.textContent.trim() : "") ||
+      (chapterTitleEl && chapterTitleEl.textContent ? chapterTitleEl.textContent.trim() : "") ||
+      docTitle();
+    if (!title) return null;
+
+    const coverImg = document.querySelector(".readerCatalog_bookInfo_cover img");
+    const bookId = (bi && bi.bookId) || "";
+    return {
+      key: derivedCb || bookId || infoId || title,
+      title,
+      author: (bi && bi.author) || "",
+      cover: (bi && bi.cover) || (coverImg && coverImg.src) || "",
+      bookId,
+      infoId,
+      cbBookId: derivedCb || signals.cbBookId || "",
+      readerUrl: location.href,
+      pdfUrl: "",
+      bookType: "epub",
+      lastReadAt: Date.now(),
+    };
+  }
+
+  function detectBook() {
+    return detectPdf() || detectEpub();
   }
 
   function waitForPdf(timeoutMs) {
     return new Promise((resolve) => {
       const start = Date.now();
       const tick = () => {
-        const ctx = detectPdf();
+        const ctx = detectBook();
         if (ctx) {
           resolve(ctx);
           return;
@@ -613,7 +681,7 @@
     });
   }
 
-  /* ============================== ���书单 ============================== */
+  /* ============================== 本地书单 ============================== */
 
   function readCache() {
     const v = storeGet(STORE.books, {});
@@ -632,6 +700,7 @@
       infoId: ctx.infoId,
       cbBookId: ctx.cbBookId,
       readerUrl: ctx.readerUrl,
+      bookType: ctx.bookType || "pdf",
       lastReadAt: normalizeTs(Date.now()),
     };
     const entries = Object.values(cache)
@@ -649,13 +718,14 @@
   function normalizeBook(b) {
     return {
       key: b.key || b.title,
-      title: b.title || "����",
+      title: b.title || "未命名",
       author: b.author || "",
       cover: b.cover || "",
       bookId: b.bookId || "",
       infoId: b.infoId || "",
       cbBookId: b.cbBookId || "",
       readerUrl: b.readerUrl || "",
+      bookType: b.bookType || "pdf",
       lastReadAt: toMs(b.lastReadAt),
       disabled: false,
       source: b.source || "",
@@ -715,11 +785,11 @@
       if (!res || !res.ok) throw new Error(`shelf ${res && res.status}`);
       const j = await res.json();
       state.shelf = extractShelfBooks(j);
-      log(`书架：共解析 ${state.shelf.length} ����� PDF �);
+      log(`书架：共解析 ${state.shelf.length} 本可确认的书`);
       renderSidebar();
     } catch (e) {
       state.shelfLoaded = false;
-      warn("书架接口不可���仅使用本地��", e && e.message ? e.message : e);
+      warn("书架接口不可用，仅使用本地记录", e && e.message ? e.message : e);
     } finally {
       state.shelfLoading = false;
     }
@@ -735,7 +805,7 @@
           : [];
     if (arr.length) {
       try {
-        log("书架首条字�", Object.keys(arr[0]).join(","));
+        log("书架首条字段", Object.keys(arr[0]).join(","));
       } catch (e) {
         /* ignore */
       }
@@ -763,7 +833,9 @@
           b.pdfType === 1 ||
           fmt.includes("pdf") ||
           /\.pdf(?:[?#]|$)/i.test(String(b.fileUrl || b.url || ""));
-        if (!isPdf || !title) return null;
+        const isEpub =
+          !isPdf && !b.isEPUBComics && (fmt.includes("epub") || b.isEPUB === 1 || b.isEpub === 1);
+        if ((!isPdf && !isEpub) || !title) return null;
         return {
           key: bookId || infoId || title || `shelf-${i}`,
           title,
@@ -773,6 +845,7 @@
           infoId,
           cbBookId: /^CB_/.test(bookId) ? bookId : "",
           readerUrl,
+          bookType: isPdf ? "pdf" : "epub",
           lastReadAt: toMs(b.readUpdateTime ?? b.updateTime ?? b.lastReadTime ?? b.finishTime ?? 0),
           disabled: !readerUrl,
           source: "shelf",
@@ -781,7 +854,7 @@
       .filter(Boolean);
   }
 
-  /* ============================== 工作���� ============================== */
+  /* ============================== 工作目录伪装 ============================== */
 
   const WORK_DOC_NAME = "design-spec.pdf";
   const WORK_TREE = [
@@ -880,7 +953,15 @@
   })(WORK_TREE, "");
 
   function workDocName() {
-    return state.workMode ? WORK_DOC_NAME : `${(state.ctx && state.ctx.title) || "文档"}.pdf`;
+    if (state.workMode) return WORK_DOC_NAME;
+    const ctx = state.ctx;
+    const ext = ctx && ctx.bookType === "epub" ? "epub" : "pdf";
+    return `${(ctx && ctx.title) || "文档"}.${ext}`;
+  }
+
+  function bookTypeLabel() {
+    if (state.workMode) return "PDF";
+    return state.ctx && state.ctx.bookType === "epub" ? "EPUB" : "PDF";
   }
 
   function fileBadge(name) {
@@ -913,7 +994,7 @@
         if (node.type === "dir") {
           const open = state.workExpanded.has(node.path);
           return `<div class="wr-node wr-dir" data-path="${escapeAttr(node.path)}" style="padding-left:${pad}px" title="${escapeAttr(node.name)}">
-            <span class="wr-caret">${open ? "�" : "�"}</span><span class="wr-node-name">${escapeHtml(node.name)}</span>
+            <span class="wr-caret">${open ? "▾" : "▸"}</span><span class="wr-node-name">${escapeHtml(node.name)}</span>
           </div>${open ? workTreeHtml(node.children, d + 1) : ""}`;
         }
         const active = state.workSelected === node.path ? " active" : "";
@@ -966,9 +1047,9 @@
   function updateDocumentTitle() {
     try {
       applyWorkFavicon(!!state.workMode);
-      if (state.workMode) document.title = `${WORK_DOC_NAME} · 工作���`;
+      if (state.workMode) document.title = `${WORK_DOC_NAME} · 工作目录`;
       else if (state.originalTitle) document.title = state.originalTitle;
-      else if (state.ctx) document.title = `${state.ctx.title} - ���读书`;
+      else if (state.ctx) document.title = `${state.ctx.title} - 微信读书`;
     } catch (e) {
       /* ignore */
     }
@@ -978,7 +1059,7 @@
     try {
       applyWorkFavicon(false);
       if (state.originalTitle) document.title = state.originalTitle;
-      else if (state.ctx) document.title = `${state.ctx.title} - ���读书`;
+      else if (state.ctx) document.title = `${state.ctx.title} - 微信读书`;
     } catch (e) {
       /* ignore */
     }
@@ -1013,7 +1094,7 @@
       const btn = v.els.root.querySelector("#wr-pv-logs");
       if (btn) btn.classList.add("active");
       if (v.els.logEl) v.els.logEl.scrollTop = v.els.logEl.scrollHeight;
-    } else {
+    } else if (v.kind !== "epub") {
       requestAnimationFrame(() => {
         if (state.viewer === v) relayout(v, true);
       });
@@ -1192,6 +1273,7 @@
           color: #df4d4d; font-size: 12px; font-weight: 700; display: flex; align-items: center; justify-content: center;
           letter-spacing: .5px;
         }
+        .wr-file-icon.epub { background: #e8f5ee; color: #07945a; font-size: 10px; }
         .wr-file-main { min-width: 0; }
         .wr-file-name { font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
         .wr-file-sub { margin-top: 4px; font-size: 12px; color: #999; }
@@ -1307,6 +1389,28 @@
           flex: 1; min-height: 0; overflow: hidden; padding: 8px 14px;
           color: #8a8f98; font: 11px/1.7 Consolas, "SFMono-Regular", Menlo, monospace;
         }
+        .wr-epub-scroll { position: absolute; inset: 0; overflow: auto; background: #fff; }
+        .wr-epub-page { display: block; max-width: 880px; margin: 0 auto; padding: 40px 48px 90px; background: #fff; }
+        .wr-epub-chapter {
+          max-width: 34%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+          color: #666; font-size: 12px;
+        }
+        .wr-epub-toc { position: absolute; inset: 0; z-index: 6; display: flex; flex-direction: column; background: #fff; }
+        .wr-epub-toc.hidden { display: none; }
+        .wr-epub-toc-head {
+          height: 44px; flex: 0 0 44px; display: flex; align-items: center; justify-content: space-between;
+          padding: 0 14px; border-bottom: 1px solid #ececec; font-size: 13px; color: #333;
+        }
+        .wr-epub-toc-head button { border: 0; background: transparent; font-size: 18px; cursor: pointer; color: #888; }
+        .wr-epub-toc-list { flex: 1; overflow: auto; padding: 6px 0 20px; }
+        .wr-epub-toc-item {
+          padding: 5px 18px; font-size: 13px; color: #444; cursor: pointer;
+          white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+        }
+        .wr-epub-toc-item:hover { background: #f5f5f5; }
+        .wr-epub-toc-item.active { color: #07c160; background: #f2f9f5; }
+        .wr-epub-toc-item.level2 { padding-left: 36px; font-size: 12px; color: #777; }
+        .wr-epub-toc-item.level3 { padding-left: 52px; font-size: 12px; color: #888; }
         .wr-ball {
           position: fixed; right: 24px; bottom: 24px; width: 48px; height: 48px; border-radius: 50%;
           background: #07c160; color: #fff; font-size: 18px; display: flex; align-items: center; justify-content: center;
@@ -1323,11 +1427,11 @@
       <div class="wr-shell" id="shell">
         <aside class="wr-side">
           <div class="wr-side-head">
-            <span class="wr-side-title" id="wr-side-title" title="切换书籍 / 工作���">���读书</span>
-            <button class="wr-refresh" id="refresh" title="刷新书架">�</button>
+            <span class="wr-side-title" id="wr-side-title" title="切换书籍 / 工作目录">微信读书</span>
+            <button class="wr-refresh" id="refresh" title="刷新书架">↻</button>
           </div>
           <div class="wr-list" id="list"></div>
-          <div class="wr-side-foot" id="wr-side-foot">仅显示支� PDF 阅�的书</div>
+          <div class="wr-side-foot" id="wr-side-foot">仅显示支持 PDF 阅读的书</div>
         </aside>
         <div class="wr-resizer" id="wr-resizer-left" title="拖动调整宽度"></div>
         <main class="wr-main" id="main">
@@ -1336,7 +1440,7 @@
           <div class="wr-preview" id="preview" hidden></div>
         </main>
       </div>
-      <div class="wr-ball" id="ball" hidden>�</div>
+      <div class="wr-ball" id="ball" hidden>微</div>
       <div class="wr-toast" id="toast"></div>
     `;
     document.body.appendChild(host);
@@ -1393,7 +1497,7 @@
       }
       state.shelf = [];
       loadShelf(true);
-      toast("正在刷新书架�");
+      toast("正在刷新书架…");
     });
     ui.list.addEventListener("click", (ev) => {
       if (state.workMode) {
@@ -1436,7 +1540,7 @@
       const book = mergedBooks().find((b) => b.key === key);
       if (!book) return;
       if (!book.readerUrl) {
-        toast("请先在官方书架打�€�€次这���，之后会出现在这�");
+        toast("请先在官方书架打开一次这本书，之后会出现在这里");
         return;
       }
       if (state.ctx && book.key === state.ctx.key) {
@@ -1480,7 +1584,7 @@
     const ui = state.ui;
     if (!ui) return;
     if (state.workMode) {
-      ui.sideTitle.textContent = "工作���";
+      ui.sideTitle.textContent = "工作目录";
       ui.sideFoot.textContent = `Java 17 · Maven · ${state.workBranch}`;
       const branches = ["main", "develop", "release/2026.11", "feature/order-refactor"];
       const menu = state.branchMenuOpen
@@ -1492,8 +1596,8 @@
             .join("")}</div>`
         : "";
       ui.list.innerHTML = `<div class="wr-tree">
-        <div class="wr-workspace" id="wr-workspace" title="折叠/展开工作�">
-          <span class="wr-caret">${state.workCollapsed ? "�" : "�"}</span>
+        <div class="wr-workspace" id="wr-workspace" title="折叠/展开工作区">
+          <span class="wr-caret">${state.workCollapsed ? "▸" : "▾"}</span>
           <span class="wr-workspace-name">ttigd-manage-web</span>
         </div>
         ${
@@ -1501,7 +1605,7 @@
             ? ""
             : `<div class="wr-branch" id="wr-branch" title="切换分支">
                 <span class="wr-branch-name">${escapeHtml(state.workBranch)}</span>
-                <span class="wr-caret">�</span>
+                <span class="wr-caret">▾</span>
                 <span class="wr-changes">3 changes</span>
               </div>
               ${menu}
@@ -1510,18 +1614,19 @@
       </div>`;
       return;
     }
-    ui.sideTitle.textContent = "���读书";
-    ui.sideFoot.textContent = "仅显示支� PDF 阅�的书";
+    ui.sideTitle.textContent = "微信读书";
+    ui.sideFoot.textContent = "仅显示支持 PDF / EPUB 的书";
     const books = mergedBooks();
     ui.list.innerHTML = books
       .map((b) => {
         const active = state.ctx && b.key === state.ctx.key;
         const disabled = !b.readerUrl && !active;
+        const type = b.bookType === "epub" ? "EPUB" : "PDF";
         const sub = active
-          ? "PDF 文档 · 点击卡片预�"
+          ? `${type} 文档 · 点击卡片阅读`
           : disabled
-            ? "PDF · 请先在官方书架点�€�€�"
-            : `PDF · ${b.lastReadAt ? timeAgo(b.lastReadAt) : "尚未打开"}`;
+            ? `${type} · 请先在官方书架点开一次`
+            : `${type} · ${b.lastReadAt ? timeAgo(b.lastReadAt) : "尚未打开"}`;
         return `<div class="wr-item ${active ? "active" : ""} ${disabled ? "disabled" : ""}" data-key="${escapeAttr(
           b.key,
         )}" title="${escapeAttr(b.title)}">
@@ -1544,22 +1649,22 @@
       ui.head.innerHTML = `
         <span class="wr-head-doc">PDF</span>
         <div class="wr-head-main">
-          <div class="wr-head-title" id="wr-head-title" title="点击隐藏/显示阅��">${escapeHtml(WORK_DOC_NAME)}</div>
+          <div class="wr-head-title" id="wr-head-title" title="点击隐藏/显示阅读区">${escapeHtml(WORK_DOC_NAME)}</div>
           <div class="wr-head-sub">工作文档 · PDF</div>
         </div>
         <span class="wr-head-spacer"></span>
-        <button class="wr-exit" id="wr-exit" title="�€出微信模�">�</button>
+        <button class="wr-exit" id="wr-exit" title="退出微信模式">⏏</button>
       `;
     } else {
-      const sub = ctx.author ? `${ctx.author} · PDF` : "PDF 文档";
+      const sub = ctx.author ? `${ctx.author} · ${bookTypeLabel()}` : `${bookTypeLabel()} 文档`;
       ui.head.innerHTML = `
         ${avatarHtml(ctx, "wr-head-cover")}
         <div class="wr-head-main">
-          <div class="wr-head-title" id="wr-head-title" title="点击隐藏/显示阅��">${escapeHtml(ctx.title)}</div>
+          <div class="wr-head-title" id="wr-head-title" title="点击隐藏/显示阅读区">${escapeHtml(ctx.title)}</div>
           <div class="wr-head-sub">${escapeHtml(sub)}</div>
         </div>
         <span class="wr-head-spacer"></span>
-        <button class="wr-exit" id="wr-exit" title="�€出微信模�">�</button>
+        <button class="wr-exit" id="wr-exit" title="退出微信模式">⏏</button>
       `;
     }
     const headTitle = ui.head.querySelector("#wr-head-title");
@@ -1576,7 +1681,7 @@
     if (state.logsOnly && !state.viewer) {
       ui.chat.classList.add("is-logs");
       ui.chat.innerHTML = `<div class="wr-chatlog">
-        <div class="wr-chatlog-head"><span class="wr-pv-dot"></span>运�日志<span class="wr-log-src" id="wr-chatlog-src">模拟</span></div>
+        <div class="wr-chatlog-head"><span class="wr-pv-dot"></span>运行日志<span class="wr-log-src" id="wr-chatlog-src">模拟</span></div>
         <div class="wr-chatlog-body" id="wr-chatlog-body"></div>
       </div>`;
       startChatLogs();
@@ -1585,12 +1690,12 @@
     ui.chat.classList.remove("is-logs");
     const docName = workDocName();
     ui.chat.innerHTML = `
-      <div class="wr-sys">—�€ ${escapeHtml(docName)} —�€</div>
-      <div class="wr-file" id="wr-file" role="button" tabindex="0" title="点击预�文档">
-        <div class="wr-file-icon">PDF</div>
+      <div class="wr-sys">—— ${escapeHtml(docName)} ——</div>
+      <div class="wr-file" id="wr-file" role="button" tabindex="0" title="点击打开文档">
+        <div class="wr-file-icon ${ctx.bookType === "epub" ? "epub" : ""}">${bookTypeLabel()}</div>
         <div class="wr-file-main">
           <div class="wr-file-name">${escapeHtml(docName)}</div>
-          <div class="wr-file-sub">PDF 文档 · 点击预�</div>
+          <div class="wr-file-sub">${bookTypeLabel()} 文档 · 点击阅读</div>
         </div>
       </div>
     `;
@@ -1612,7 +1717,7 @@
     renderChat();
   }
 
-  /* ============================== PDF 预� ============================== */
+  /* ============================== PDF 预览 ============================== */
 
   async function resolvePdfUrl() {
     const ctx = state.ctx;
@@ -1658,7 +1763,7 @@
   function gmFetchArrayBuffer(url, onProgress, headers) {
     return new Promise((resolve, reject) => {
       if (typeof GM_xmlhttpRequest !== "function") {
-        reject(new Error("当前脚本管理器不��� GM_xmlhttpRequest"));
+        reject(new Error("当前脚本管理器不支持 GM_xmlhttpRequest"));
         return;
       }
       let settled = false;
@@ -1686,7 +1791,7 @@
             if (res && res.status >= 200 && res.status < 300 && res.response) done(resolve, res.response);
             else done(reject, new Error(`HTTP ${(res && res.status) || 0}`));
           },
-          onerror: () => done(reject, new Error("网络错�")),
+          onerror: () => done(reject, new Error("网络错误")),
           ontimeout: () => done(reject, new Error("下载超时")),
         });
       } catch (e) {
@@ -1705,18 +1810,18 @@
         buf = await gmFetchArrayBuffer(url, onProgress, { Referer: "https://weread.qq.com/" });
       } catch (e2) {
         gmError = e2;
-        warn("GM 下载失败，尝试页� fetch", e2 && e2.message ? e2.message : e2);
+        warn("GM 下载失败，尝试页面 fetch", e2 && e2.message ? e2.message : e2);
       }
     }
     if (!buf) {
       const fetchFn = typeof W.fetch === "function" ? W.fetch : window.fetch;
       const res = await fetchFn.call(W, url, { credentials: "omit" });
       if (!res || !res.ok) {
-        throw new Error(`HTTP ${(res && res.status) || 0}${gmError ? `（GM�${gmError.message}）` : ""}`);
+        throw new Error(`HTTP ${(res && res.status) || 0}${gmError ? `（GM：${gmError.message}）` : ""}`);
       }
       buf = await res.arrayBuffer();
     }
-    if (!buf || (buf.byteLength != null && buf.byteLength === 0)) throw new Error("文档内�为空");
+    if (!buf || (buf.byteLength != null && buf.byteLength === 0)) throw new Error("文档内容为空");
     return buf;
   }
 
@@ -1744,7 +1849,7 @@
       const res = await fetchFn.call(W, PDFJS_WORKER);
       if (res && res.ok) pdfWorkerText = await res.text();
     } catch (e) {
-      /* � GM */
+      /* 走 GM */
     }
     if (!pdfWorkerText) {
       pdfWorkerText = await new Promise((resolve, reject) => {
@@ -1761,7 +1866,7 @@
               r && r.status >= 200 && r.status < 300
                 ? resolve(r.responseText || "")
                 : reject(new Error(`worker HTTP ${(r && r.status) || 0}`)),
-            onerror: () => reject(new Error("worker 网络错�")),
+            onerror: () => reject(new Error("worker 网络错误")),
             ontimeout: () => reject(new Error("worker 下载超时")),
           });
         } catch (e) {
@@ -1769,7 +1874,7 @@
         }
       });
     }
-    if (!pdfWorkerText) throw new Error("PDF worker 内�为空");
+    if (!pdfWorkerText) throw new Error("PDF worker 内容为空");
     return pdfWorkerText;
   }
 
@@ -1832,7 +1937,7 @@
 
   async function openPdfDocument(buf) {
     const lib = getPdfjs();
-    if (!lib) throw new Error("PDF 渲染库未加载（@require 失败或�线）");
+    if (!lib) throw new Error("PDF 渲染库未加载（@require 失败或离线）");
     const opts = {
       cMapUrl: `${PDFJS_BASE}cmaps/`,
       cMapPacked: true,
@@ -1888,8 +1993,8 @@
   function pvBarHtml(extra) {
     const title = workDocName();
     return `<div class="wr-pv-bar">
-      <button class="wr-pv-btn" id="wr-pv-back">� 返回</button>
-      <span class="wr-pv-title" id="wr-pv-title" title="点击隐藏/显示阅��">${escapeHtml(title)}</span>
+      <button class="wr-pv-btn" id="wr-pv-back">‹ 返回</button>
+      <span class="wr-pv-title" id="wr-pv-title" title="点击隐藏/显示阅读区">${escapeHtml(title)}</span>
       <span class="wr-pv-spacer"></span>
       ${extra || ""}
     </div>`;
@@ -1911,7 +2016,7 @@
       ${pvBarHtml("")}
       <div class="wr-pv-body">
         <div class="wr-pv-main">
-          <div class="wr-pv-status">${escapeHtml(message || "正在获取文档�")}</div>
+          <div class="wr-pv-status">${escapeHtml(message || "正在获取文档…")}</div>
         </div>
       </div>
     </div>`;
@@ -1930,7 +2035,7 @@
             <div>${escapeHtml(message || "文档打开失败")}</div>
             <div style="margin-top:12px;">
               <button id="wr-retry">重新获取</button>
-              ${url ? `<a class="wr-link" href="${escapeAttr(url)}" target="_blank" rel="noreferrer">下载原文�</a>` : ""}
+              ${url ? `<a class="wr-link" href="${escapeAttr(url)}" target="_blank" rel="noreferrer">下载原文件</a>` : ""}
             </div>
           </div>
         </div>
@@ -1966,7 +2071,7 @@
       () => `query "${pickWord()}" hits=${randInt(2, 200)} took=${randInt(5, 80)}ms`,
       3,
     ],
-    ["INFO", "ci-runner", () => `[build ${randInt(4700, 4999)}] npm test � ${randInt(180, 400)} passed`, 2],
+    ["INFO", "ci-runner", () => `[build ${randInt(4700, 4999)}] npm test — ${randInt(180, 400)} passed`, 2],
     ["INFO", "deploy", () => `staging ${hexId(7)} rolled out ${randInt(1, 4)}/4`, 1],
     ["WARN", "inventory", () => `stock below threshold sku=SKU-${randInt(1000, 9999)}`, 1],
     [
@@ -2169,7 +2274,7 @@
       polling: false,
     };
     el.__wrRealFeed = feed;
-    setLogSrc(srcEl, "连接�€", "", "正在连接 Grafana");
+    setLogSrc(srcEl, "连接中…", "", "正在连接 Grafana");
 
     if (srcEl && !srcEl.__wrOpenBound) {
       srcEl.__wrOpenBound = true;
@@ -2197,18 +2302,18 @@
         if (err) {
           if (!feed.warned) {
             feed.warned = true;
-            warn("Grafana 日志不可���使用模拟日志", err.message || err);
+            warn("Grafana 日志不可用，使用模拟日志", err.message || err);
           }
-          setLogSrc(srcEl, feed.first ? "离线" : "模拟", "", "Grafana 不可���使用模拟日志");
+          setLogSrc(srcEl, feed.first ? "离线" : "模拟", "", "Grafana 不可用，使用模拟日志");
           feed.retryAt = Date.now() + REAL_LOGS.retryMs;
           return;
         }
         if (status === 401 || status === 403) {
           if (!feed.warned) {
             feed.warned = true;
-            warn("Grafana 日志���录（HTTP " + status + "�");
+            warn("Grafana 日志未登录（HTTP " + status + "）");
           }
-          setLogSrc(srcEl, "����", "err", "点击打开 Grafana 登录");
+          setLogSrc(srcEl, "未登录", "err", "点击打开 Grafana 登录");
           feed.retryAt = Date.now() + REAL_LOGS.retryMs;
           return;
         }
@@ -2313,7 +2418,7 @@
     });
   }
 
-  /* ---------- ��� PDF 阅�� ---------- */
+  /* ---------- 自建 PDF 阅读器 ---------- */
 
   function maxLogWidth(v) {
     const bodyW = v && v.els && v.els.body ? v.els.body.clientWidth : 0;
@@ -2353,23 +2458,23 @@
     ui.preview.hidden = false;
     ui.preview.innerHTML = `<div class="wr-pv">
       ${pvBarHtml(`
-        <button class="wr-pv-btn" id="wr-pv-prev" title="上一�">�</button>
-        <span class="wr-pv-pageno"><input id="wr-pv-page-input" value="1" inputmode="numeric"> / <span id="wr-pv-page-count">�</span></span>
-        <button class="wr-pv-btn" id="wr-pv-next" title="下一�">�</button>
-        <button class="wr-pv-btn" id="wr-pv-zoom-out" title="缩小">�</button>
+        <button class="wr-pv-btn" id="wr-pv-prev" title="上一页">‹</button>
+        <span class="wr-pv-pageno"><input id="wr-pv-page-input" value="1" inputmode="numeric"> / <span id="wr-pv-page-count">–</span></span>
+        <button class="wr-pv-btn" id="wr-pv-next" title="下一页">›</button>
+        <button class="wr-pv-btn" id="wr-pv-zoom-out" title="缩小">−</button>
         <span class="wr-pv-zoom" id="wr-pv-zoom">${Math.round(DEFAULT_ZOOM * 100)}%</span>
         <button class="wr-pv-btn" id="wr-pv-zoom-in" title="放大">+</button>
         <button class="wr-pv-btn" id="wr-pv-fit">适应宽度</button>
-        <button class="wr-pv-btn active" id="wr-pv-logs" title="切换日志�">日志</button>
+        <button class="wr-pv-btn active" id="wr-pv-logs" title="切换日志栏">日志</button>
       `)}
       <div class="wr-pv-body" id="wr-pv-body">
         <div class="wr-pv-main">
           <div class="wr-pv-scroll" id="wr-pv-scroll"><div class="wr-pv-pages" id="wr-pv-pages"></div></div>
-          <div class="wr-pv-status" id="wr-pv-status">正在解析文档�</div>
+          <div class="wr-pv-status" id="wr-pv-status">正在解析文档…</div>
         </div>
-        <div class="wr-pv-logresizer" id="wr-pv-logresizer" title="拖动调整日志栏��"></div>
+        <div class="wr-pv-logresizer" id="wr-pv-logresizer" title="拖动调整日志栏宽度"></div>
         <aside class="wr-pv-logpane" id="wr-pv-logpane">
-          <div class="wr-pv-loghead"><span class="wr-pv-dot"></span>运�日志<span class="wr-log-src" id="wr-pv-log-src">模拟</span></div>
+          <div class="wr-pv-loghead"><span class="wr-pv-dot"></span>运行日志<span class="wr-log-src" id="wr-pv-log-src">模拟</span></div>
           <div class="wr-pv-log" id="wr-pv-log"></div>
         </aside>
       </div>
@@ -2433,7 +2538,7 @@
     $("#wr-pv-fit").addEventListener("click", () => setZoom(v, 1));
     $("#wr-pv-logs").addEventListener("click", (ev) => {
       if (state.logsOnly) {
-        toast("点击顶部文件名可切回阅��");
+        toast("点击顶部文件名可切回阅读区");
         return;
       }
       v.logsOn = !v.logsOn;
@@ -2541,7 +2646,7 @@
       })
       .catch(() => {
         if (v && state.viewer === v) {
-          p.el.innerHTML = `<div class="wr-pv-page-err">� ${p.num} 页渲染失�</div>`;
+          p.el.innerHTML = `<div class="wr-pv-page-err">第 ${p.num} 页渲染失败</div>`;
         }
       })
       .finally(() => {
@@ -2652,7 +2757,12 @@
       /* ignore */
     }
     try {
-      window.removeEventListener("resize", v.resizeHandler);
+      if (v.resizeHandler) window.removeEventListener("resize", v.resizeHandler);
+    } catch (e) {
+      /* ignore */
+    }
+    try {
+      if (v.epubNavTimer) clearTimeout(v.epubNavTimer);
     } catch (e) {
       /* ignore */
     }
@@ -2688,7 +2798,7 @@
       }
       v.doc = doc;
       v.pageCount = doc.numPages;
-      if (!v.pageCount) throw new Error("文档没有���示的页面");
+      if (!v.pageCount) throw new Error("文档没有可显示的页面");
       buildPages(v);
       relayout(v, false);
       requestAnimationFrame(() => {
@@ -2705,30 +2815,425 @@
 
   async function openPreview() {
     if (!state.ui || !state.ctx) return;
+    if (state.ctx.bookType === "epub") {
+      try {
+        await openEpubPreview();
+      } catch (e) {
+        destroyViewer();
+        showPreviewError(`EPUB 加载失败：${e && e.message ? e.message : e}`, "");
+      }
+      return;
+    }
     const token = ++state.previewToken;
     destroyViewer();
-    showPreviewLoading("正在获取文档�");
+    showPreviewLoading("正在获取文档…");
     const url = await resolvePdfUrl();
     if (token !== state.previewToken) return;
     if (!url) {
-      showPreviewError("没有拿到 PDF 地址，�点�€�重新获取�€�或回官方阅读器打开�€�", "");
+      showPreviewError("没有拿到 PDF 地址，请点「重新获取」或回官方阅读器打开一次", "");
       return;
     }
 
-    showPreviewLoading("正在下载文档�");
+    showPreviewLoading("正在下载文档…");
     try {
       const buf = await downloadPdfBytes(url, (loaded, total) => {
         if (token !== state.previewToken) return;
         const pct = total ? Math.floor((loaded / total) * 100) : null;
-        setPreviewStatus(pct == null ? "正在下载文档�" : `正在下载文档 ${pct}%`);
+        setPreviewStatus(pct == null ? "正在下载文档…" : `正在下载文档 ${pct}%`);
       });
       if (token !== state.previewToken) return;
-      showPreviewLoading("正在解析文档�");
+      showPreviewLoading("正在解析文档…");
       await showPdfViewer(buf, url, token);
     } catch (e) {
       if (token !== state.previewToken) return;
       destroyViewer();
-      showPreviewError(`文档加载失败�${e && e.message ? e.message : e}`, url);
+      showPreviewError(`文档加载失败：${e && e.message ? e.message : e}`, url);
+    }
+  }
+
+  /* ============================== EPUB 阅读器 ============================== */
+
+  function delay(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  function readOfficialToc() {
+    const nodes = [...document.querySelectorAll(".readerCatalog_list_item")];
+    return nodes
+      .map((el, index) => {
+        const titleEl = el.querySelector(".readerCatalog_list_item_title_text");
+        const levelEl = el.querySelector('[class*="readerCatalog_list_item_level_"]');
+        let level = 1;
+        if (levelEl) {
+          const m = String(levelEl.className).match(/level_(\d+)/);
+          if (m) level = Number(m[1]) || 1;
+        }
+        const title = (titleEl ? titleEl.textContent : el.textContent || "").replace(/\s+/g, " ").trim();
+        return title ? { index, title, level, el } : null;
+      })
+      .filter(Boolean);
+  }
+
+  async function readOfficialTocReady() {
+    let items = readOfficialToc();
+    if (items.length) return items;
+    const btn =
+      document.querySelector(".rbb_item.catalog") || document.querySelector(".readerControls_item.catalog");
+    if (btn) {
+      try {
+        btn.click();
+      } catch (e) {
+        /* ignore */
+      }
+    }
+    for (let i = 0; i < 12 && !items.length; i++) {
+      await delay(250);
+      items = readOfficialToc();
+    }
+    return items;
+  }
+
+  function officialCatalogVisible() {
+    const el = document.querySelector(".readerCatalog");
+    if (!el) return false;
+    try {
+      const style = getComputedStyle(el);
+      if (style.display === "none" || style.visibility === "hidden") return false;
+    } catch (e) {
+      /* ignore */
+    }
+    const rect = el.getBoundingClientRect();
+    if (rect.width > 0 && rect.height > 0) return true;
+    return readOfficialToc().length > 0;
+  }
+
+  async function ensureOfficialCatalogOpen() {
+    if (officialCatalogVisible()) return true;
+    const btn =
+      document.querySelector(".rbb_item.catalog") || document.querySelector(".readerControls_item.catalog");
+    if (btn) {
+      try {
+        btn.click();
+      } catch (e) {
+        /* ignore */
+      }
+    }
+    for (let i = 0; i < 10; i++) {
+      await delay(150);
+      if (officialCatalogVisible() || readOfficialToc().length) return true;
+    }
+    return readOfficialToc().length > 0;
+  }
+
+  function currentReaderChapterTitle() {
+    const el = document.querySelector(".readerTopBar_title_chapter");
+    return el && el.textContent ? el.textContent.replace(/\s+/g, " ").trim() : "";
+  }
+
+  function findTocIndex(items, title) {
+    const needle = String(title || "").trim();
+    if (!needle) return -1;
+    return items.findIndex((item) => item.title === needle);
+  }
+
+  function clickOfficialTocItem(item) {
+    if (!item || !item.el) return;
+    const inner = item.el.querySelector(".readerCatalog_list_item_inner");
+    try {
+      (inner || item.el).click();
+    } catch (e) {
+      /* ignore */
+    }
+  }
+
+  function showEpubStatus(v, text) {
+    if (!v || !v.els || !v.els.status) return;
+    v.els.status.style.display = "flex";
+    v.els.status.textContent = text || "正在加载章节…";
+  }
+
+  function hideEpubStatus(v) {
+    if (v && v.els && v.els.status) v.els.status.style.display = "none";
+  }
+
+  function renderEpubToc(v) {
+    if (!v || !v.els || !v.els.tocList) return;
+    v.els.tocList.innerHTML = v.toc
+      .map((item) => {
+        const active = item.index === v.currentIndex ? " active" : "";
+        const level = item.level > 1 ? ` level${Math.min(item.level, 3)}` : "";
+        return `<div class="wr-epub-toc-item${level}${active}" data-index="${item.index}">${escapeHtml(
+          item.title,
+        )}</div>`;
+      })
+      .join("");
+  }
+
+  function renderEpubChapter(v, key, title) {
+    if (!v || state.viewer !== v) return;
+    let html = chapterHtmlFor(key);
+    const css = chapterCssFor(key);
+    if (!html) {
+      const fallback = document.querySelector(".readerChapterContent");
+      if (fallback) html = fallback.innerHTML || "";
+    }
+    if (!html) {
+      showEpubStatus(v, "没有拿到章节内容，请重试");
+      return;
+    }
+
+    const parsed = new DOMParser().parseFromString(html, "text/html");
+    parsed.querySelectorAll("script,iframe,object,embed").forEach((node) => node.remove());
+    parsed.querySelectorAll("*").forEach((el) => {
+      for (const attr of [...el.attributes]) {
+        if (/^on/i.test(attr.name)) el.removeAttribute(attr.name);
+      }
+    });
+    parsed.querySelectorAll("a[href]").forEach((a) => {
+      const href = a.getAttribute("href") || "";
+      if (!/^https?:/i.test(href)) a.removeAttribute("href");
+    });
+
+    const bodyHtml = parsed.body ? parsed.body.innerHTML : html;
+    const host = v.els.page;
+    let sr = host.shadowRoot;
+    if (!sr) sr = host.attachShadow({ mode: "open" });
+    sr.innerHTML = "";
+    const style = document.createElement("style");
+    style.textContent = `${css}
+:host { display: block; }
+.wr-epub-content { font: 17px/1.9 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; color: #222; word-wrap: break-word; }
+.wr-epub-content p { margin: 0 0 1.05em; line-height: 1.9; }
+.wr-epub-content .section { text-indent: 2em; }
+.wr-epub-content h1, .wr-epub-content h2, .wr-epub-content h3 { line-height: 1.4; margin: 1.4em 0 .7em; }
+.wr-epub-content img { max-width: 100%; height: auto; }
+.wr-epub-content a { color: #576b95; text-decoration: none; }
+.wr-epub-content table { border-collapse: collapse; max-width: 100%; }
+.wr-epub-content .calibre5 { margin: 1.2em auto; }
+`;
+    sr.appendChild(style);
+    const wrap = document.createElement("div");
+    wrap.className = `wr-epub-content ${parsed.body ? parsed.body.className : ""}`;
+    wrap.innerHTML = bodyHtml;
+    sr.appendChild(wrap);
+
+    v.currentTitle = title || currentReaderChapterTitle();
+    if (v.els.chapterTitle) v.els.chapterTitle.textContent = v.currentTitle;
+    const idx = findTocIndex(v.toc, v.currentTitle);
+    if (idx >= 0) v.currentIndex = idx;
+    renderEpubToc(v);
+    hideEpubStatus(v);
+    if (v.els.scroll) v.els.scroll.scrollTop = 0;
+  }
+
+  function waitForEpubChapter(v, startAt, targetTitle, onDone) {
+    const token = v.navToken;
+    const check = () => {
+      if (state.viewer !== v || v.navToken !== token) return;
+      const currentTitle = currentReaderChapterTitle();
+      const key =
+        chapterKeyForTitle(targetTitle) ||
+        (currentTitle ? chapterKeyForTitle(currentTitle) : "") ||
+        (state.epubLastAt > startAt - 500 ? state.epubLastKey : "");
+      if (key && chapterHtmlFor(key)) {
+        renderEpubChapter(v, key, currentTitle || targetTitle || "");
+        if (typeof onDone === "function") onDone();
+        return;
+      }
+      if (Date.now() - startAt > 12000) {
+        const fallback = document.querySelector(".readerChapterContent");
+        if (fallback) {
+          renderEpubChapter(v, "", targetTitle);
+          return;
+        }
+        showEpubStatus(v, "章节加载超时，请重试");
+        return;
+      }
+      v.epubNavTimer = setTimeout(check, 250);
+    };
+    check();
+  }
+
+  async function loadEpubChapterByIndex(v, index) {
+    if (!v || !v.toc) return;
+    const target = v.toc[index];
+    if (!target) return;
+    const targetTitle = target.title;
+    v.navToken++;
+    const token = v.navToken;
+    const startAt = Date.now();
+    showEpubStatus(v, "正在加载章节…");
+
+    await ensureOfficialCatalogOpen();
+    if (token !== v.navToken || state.viewer !== v) return;
+
+    let items = readOfficialToc();
+    if (!items.length) {
+      const btn =
+        document.querySelector(".rbb_item.catalog") || document.querySelector(".readerControls_item.catalog");
+      if (btn) btn.click();
+      await delay(250);
+      items = readOfficialToc();
+    }
+    if (token !== v.navToken || state.viewer !== v) return;
+
+    const item = items.find((it) => it.title === targetTitle) || items[index];
+    if (!item) {
+      showEpubStatus(v, "没有找到该章节，请重试");
+      return;
+    }
+    clickOfficialTocItem(item);
+    waitForEpubChapter(v, startAt, targetTitle, () => {
+      v.currentIndex = index;
+      renderEpubToc(v);
+    });
+  }
+
+  function buildEpubViewerUi() {
+    const ui = state.ui;
+    state.previewOpen = true;
+    ui.preview.hidden = false;
+    ui.preview.innerHTML = `<div class="wr-pv wr-epub-viewer">
+      ${pvBarHtml(`
+        <button class="wr-pv-btn" id="epub-prev" title="上一节">上一章</button>
+        <span class="wr-epub-chapter" id="epub-chapter-title"></span>
+        <button class="wr-pv-btn" id="epub-next" title="下一节">下一章</button>
+        <button class="wr-pv-btn" id="epub-toc-btn" title="目录">目录</button>
+        <button class="wr-pv-btn active" id="wr-pv-logs" title="切换日志栏">日志</button>
+      `)}
+      <div class="wr-pv-body" id="wr-pv-body">
+        <div class="wr-pv-main">
+          <div class="wr-epub-scroll" id="wr-epub-scroll">
+            <article class="wr-epub-page" id="wr-epub-page"></article>
+          </div>
+          <div class="wr-pv-status" id="wr-pv-status">正在加载章节…</div>
+          <div class="wr-epub-toc hidden" id="wr-epub-toc">
+            <div class="wr-epub-toc-head"><span>目录</span><button id="epub-toc-close" title="关闭">×</button></div>
+            <div class="wr-epub-toc-list" id="wr-epub-toc-list"></div>
+          </div>
+        </div>
+        <div class="wr-pv-logresizer" id="wr-pv-logresizer" title="拖动调整日志栏宽度"></div>
+        <aside class="wr-pv-logpane" id="wr-pv-logpane">
+          <div class="wr-pv-loghead"><span class="wr-pv-dot"></span>运行日志<span class="wr-log-src" id="wr-pv-log-src">模拟</span></div>
+          <div class="wr-pv-log" id="wr-pv-log"></div>
+        </aside>
+      </div>
+    </div>`;
+
+    const $ = (sel) => ui.preview.querySelector(sel);
+    const v = {
+      kind: "epub",
+      root: $(".wr-pv"),
+      toc: [],
+      currentIndex: -1,
+      currentTitle: "",
+      navToken: 0,
+      epubNavTimer: null,
+      logsOn: true,
+      logTimer: null,
+      els: {
+        root: $(".wr-pv"),
+        body: $("#wr-pv-body"),
+        scroll: $("#wr-epub-scroll"),
+        page: $("#wr-epub-page"),
+        status: $("#wr-pv-status"),
+        chapterTitle: $("#epub-chapter-title"),
+        toc: $("#wr-epub-toc"),
+        tocList: $("#wr-epub-toc-list"),
+        logEl: $("#wr-pv-log"),
+        logSrc: $("#wr-pv-log-src"),
+        logPane: $("#wr-pv-logpane"),
+        logResizer: $("#wr-pv-logresizer"),
+      },
+    };
+    state.viewer = v;
+    state.logWidth = applyLogWidth(v, state.logWidth);
+
+    const back = $("#wr-pv-back");
+    if (back) back.addEventListener("click", hidePreview);
+    const pvTitle = $("#wr-pv-title");
+    if (pvTitle) pvTitle.addEventListener("click", toggleLogsOnly);
+
+    $("#epub-prev").addEventListener("click", () => {
+      const next = Math.max(0, (v.currentIndex >= 0 ? v.currentIndex : 0) - 1);
+      loadEpubChapterByIndex(v, next);
+    });
+    $("#epub-next").addEventListener("click", () => {
+      const next = Math.min(v.toc.length - 1, (v.currentIndex >= 0 ? v.currentIndex : 0) + 1);
+      loadEpubChapterByIndex(v, next);
+    });
+    $("#epub-toc-btn").addEventListener("click", () => {
+      v.els.toc.classList.toggle("hidden");
+    });
+    $("#epub-toc-close").addEventListener("click", () => v.els.toc.classList.add("hidden"));
+    v.els.tocList.addEventListener("click", (ev) => {
+      const item = ev.target.closest(".wr-epub-toc-item");
+      if (!item) return;
+      const index = Number(item.getAttribute("data-index"));
+      v.els.toc.classList.add("hidden");
+      loadEpubChapterByIndex(v, index);
+    });
+    $("#wr-pv-logs").addEventListener("click", (ev) => {
+      if (state.logsOnly) {
+        toast("点击顶部文件名可切回阅读区");
+        return;
+      }
+      v.logsOn = !v.logsOn;
+      v.els.logPane.classList.toggle("hidden", !v.logsOn);
+      if (v.els.logResizer) v.els.logResizer.classList.toggle("hidden", !v.logsOn);
+      ev.currentTarget.classList.toggle("active", v.logsOn);
+      if (v.logsOn) v.els.logEl.scrollTop = v.els.logEl.scrollHeight;
+    });
+
+    bindHorizontalDrag(v.els.logResizer, {
+      getWidth: () => v.els.logPane.getBoundingClientRect().width || state.logWidth,
+      min: 220,
+      max: () => maxLogWidth(v),
+      invert: true,
+      onMove: (w) => {
+        state.logWidth = w;
+        v.els.logPane.style.width = `${w}px`;
+      },
+      onEnd: () => storeSet(STORE.logWidth, state.logWidth),
+    });
+
+    v.resizeHandler = () => {
+      clearTimeout(v._resizeTimer);
+      v._resizeTimer = setTimeout(() => {
+        if (state.viewer !== v) return;
+        state.logWidth = applyLogWidth(v, state.logWidth);
+      }, 160);
+    };
+    window.addEventListener("resize", v.resizeHandler);
+
+    startWorkLogs(v);
+    return v;
+  }
+
+  async function openEpubPreview() {
+    const token = ++state.previewToken;
+    destroyViewer();
+    showPreviewLoading("正在加载章节…");
+    await ensureOfficialCatalogOpen();
+    const toc = await readOfficialTocReady();
+    if (token !== state.previewToken) return;
+    if (!toc.length) {
+      showPreviewError("没有读到目录，请回官方阅读器打开一次", "");
+      return;
+    }
+    const v = buildEpubViewerUi();
+    v.toc = toc;
+    const title = currentReaderChapterTitle() || (toc[0] && toc[0].title) || "";
+    v.currentIndex = findTocIndex(v.toc, title);
+    v.currentTitle = title;
+    if (v.els.chapterTitle) v.els.chapterTitle.textContent = title;
+    renderEpubToc(v);
+
+    const key = chapterKeyForTitle(title) || state.epubLastKey;
+    if (key && chapterHtmlFor(key)) {
+      renderEpubChapter(v, key, title);
+    } else {
+      loadEpubChapterByIndex(v, v.currentIndex >= 0 ? v.currentIndex : 0);
     }
   }
 
@@ -2745,7 +3250,7 @@
     if (state.logsOnly) renderChat();
   }
 
-  /* ============================== 进入 / �€� ============================== */
+  /* ============================== 进入 / 退出 ============================== */
 
   function applyViewport() {
     if (!state.ui || !state.ctx) return;
@@ -2784,12 +3289,12 @@
       state.ui.shell.style.display = "none";
       state.ui.ball.hidden = false;
     }
-    toast("已�€€出微信模�");
+    toast("已退出微信模式");
   }
 
   function mount(ctx) {
     state.ctx = ctx;
-    if (!document.title.includes("工作���")) state.originalTitle = document.title;
+    if (!document.title.includes("工作目录")) state.originalTitle = document.title;
     rememberBook(ctx);
     ensureRoot();
     if (!state.ui) return;
@@ -2807,7 +3312,9 @@
     updateDocumentTitle();
     applyViewport();
     loadShelf();
-    log(`已接� PDF 书�€${ctx.title}�${ctx.cbBookId ? ` · ${ctx.cbBookId}` : ""}`);
+    log(
+      `已接管 ${ctx.bookType === "epub" ? "EPUB" : "PDF"} 书《${ctx.title}》${ctx.cbBookId ? ` · ${ctx.cbBookId}` : ""}`,
+    );
   }
 
   function teardown() {
@@ -2827,7 +3334,7 @@
     hideOfficial(false);
   }
 
-  /* ============================== ��� ============================== */
+  /* ============================== 启动 ============================== */
 
   async function boot() {
     if (!isReaderPage()) return;
@@ -2835,13 +3342,13 @@
     const ctx = await waitForPdf(DETECT_TIMEOUT);
     if (token !== state.bootToken) return;
     if (!ctx) {
-      log("�测到 PDF 管线，保持官方界�");
+      log("未检测到 PDF / EPUB 管线，保持官方界面");
       return;
     }
     mount(ctx);
   }
 
-  let lastReaderInfoId = isReaderPage() ? pathInfoId() : "";
+  let lastReaderInfoId = isReaderPage() ? readerInfoBase(pathInfoId()) : "";
 
   function watchRoute() {
     setInterval(() => {
@@ -2850,7 +3357,7 @@
         lastReaderInfoId = "";
         return;
       }
-      const id = pathInfoId();
+      const id = readerInfoBase(pathInfoId());
       if (id && id !== lastReaderInfoId) {
         lastReaderInfoId = id;
         teardown();
@@ -2862,7 +3369,7 @@
   function registerMenu() {
     if (typeof GM_registerMenuCommand !== "function") return;
     try {
-      GM_registerMenuCommand("进入/�€出微信模�", () => {
+      GM_registerMenuCommand("进入/退出微信模式", () => {
         if (state.enabled && state.ui) exitMode();
         else if (state.ctx) enterMode();
         else safeBoot();
@@ -2870,19 +3377,19 @@
       GM_registerMenuCommand("刷新书架", () => {
         state.shelf = [];
         loadShelf(true);
-        toast("正在刷新书架�");
+        toast("正在刷新书架…");
       });
       GM_registerMenuCommand("设置 Grafana Token", () => {
-        const next = window.prompt("粘贴 Grafana Service Account Token（留� = 使用浏�器登录�€�）", "");
+        const next = window.prompt("粘贴 Grafana Service Account Token（留空 = 使用浏览器登录态）", "");
         if (next === null) return;
         storeSet(STORE.grafanaToken, String(next).trim());
         restartRealLogs();
-        toast("Grafana Token 已保�");
+        toast("Grafana Token 已保存");
       });
       GM_registerMenuCommand("清除 Grafana Token", () => {
         storeSet(STORE.grafanaToken, "");
         restartRealLogs();
-        toast("已清� Grafana Token");
+        toast("已清除 Grafana Token");
       });
     } catch (e) {
       /* ignore */
@@ -2890,7 +3397,7 @@
   }
 
   function safeBoot() {
-    boot().catch((e) => warn("���失败", e));
+    boot().catch((e) => warn("启动失败", e));
   }
 
   installSignalHooks();
@@ -2910,7 +3417,20 @@
     get ctx() {
       return state.ctx;
     },
-    detect: detectPdf,
+    detect: detectBook,
+    get epub() {
+      return {
+        lastKey: state.epubLastKey,
+        lastAt: state.epubLastAt,
+        viewer: state.viewer ? state.viewer.kind || "pdf" : null,
+        chunks: [...state.epubChunks.entries()].map(([c, set]) => ({
+          c,
+          html: set.html.size,
+          css: set.css.size,
+          at: set.at,
+        })),
+      };
+    },
     enter: enterMode,
     exit: exitMode,
     refreshShelf: () => {
